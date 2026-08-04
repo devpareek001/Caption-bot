@@ -93,5 +93,5 @@ Health endpoints:
 Repository URL used by deploy manifests:
 
 ```text
-https://github.com/dreamxbotz/Dreamxbotz_caption
+https://github.com/DreamXBotz/Auto_Caption.git
 ```
