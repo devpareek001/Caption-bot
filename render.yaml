@@ -1,0 +1,41 @@
+services:
+  - type: web
+    plan: free
+    name: Dreamxbotz_caption
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    repo: https://github.com/dreamxbotz/Dreamxbotz_caption.git
+    branch: main
+    autoDeploy: false
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: FORCE_SUB
+        sync: false
+      - key: DB_NAME
+        sync: false
+      - key: DB_URL
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+      - key: BOT_PIC
+        sync: false
+      - key: DEF_CAP
+        sync: false
+      - key: CHANNEL_URL
+        sync: false
+      - key: SUPPORT_URL
+        sync: false
+      - key: SOURCE_URL
+        sync: false
+      - key: WORKERS
+        sync: false
+      - key: LOG_LEVEL
+        sync: false
+      - key: ADMINS
+        sync: false

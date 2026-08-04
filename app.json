@@ -1,0 +1,85 @@
+{
+    "name": "DreamXbotz_caption",
+    "description": "Telegram channel auto-caption bot",
+    "logo": "https://telegra.ph/file/21a8e96b45cd6ac4d3da6.jpg",
+    "keywords": ["DreamXbotz_caption", "Mongo DB"],    
+    "repository": "https://github.com/dreamxbotz/Dreamxbotz_caption",
+    "env": {
+        "API_ID": {
+            "description": "Your APP ID From my.telegram.org ",
+            "value": ""
+        },
+        "API_HASH": {
+            "description": "Your API Hash From my.telegram.org ",
+            "value": ""
+        },
+        
+        "FORCE_SUB": {
+            "description": "Your force sub channel user name without [@] ",
+            "value": "",
+            "required": false 
+        },
+        "BOT_TOKEN": {
+            "description": "Your Bot Token From @BotFather",
+            "value": ""
+        },
+        "ADMINS": {
+            "description":"Add Your admin ID multiple is use space to split"
+        },
+        
+        "DB_URL": {
+            "description": "Your Mongo DB URL Obtained From mongodb.com",
+            "value": ""
+        },
+        "DB_NAME":{ 
+            "description":"Your Mongo DB Database Name ",
+            "value": "dreamxbotz_caption",
+            "required": false
+        },
+        "BOT_USERNAME": {
+            "description": "Bot session name",
+            "value": "DreamXbotz_caption",
+            "required": false
+        },
+        "BOT_PIC": {
+            "description": "Bot start image URL",
+            "value": "",
+            "required": false
+        },
+        "DEF_CAP": {
+            "description": "Default caption template",
+            "value": "",
+            "required": false
+        },
+        "CHANNEL_URL": {
+            "description": "Main channel button URL",
+            "value": "https://t.me/dreamxbotz",
+            "required": false
+        },
+        "SUPPORT_URL": {
+            "description": "Help group button URL",
+            "value": "",
+            "required": false
+        },
+        "SOURCE_URL": {
+            "description": "Source-code button URL",
+            "value": "",
+            "required": false
+        },
+        "WORKERS": {
+            "description": "Pyrogram worker count",
+            "value": "200",
+            "required": false
+        },
+        "LOG_LEVEL": {
+            "description": "Logging level",
+            "value": "INFO",
+            "required": false
+        }
+    },
+    "buildpacks": [
+        {
+            "url": "heroku/python"
+        }
+    ]
+}
