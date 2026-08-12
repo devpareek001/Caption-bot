@@ -736,58 +736,41 @@ async def recaption_all(bot, message):
 
             if processed % 50 == 0:
 
-                try:
+                    try:
+        # history wala pura code yahan
+        async for msg in bot.get_chat_history(channel_id):
 
-                    await progress_msg.edit(
-                        "🚀 <b>Recaption running...</b>\n\n"
-                        f"📨 Processed: "
-                        f"<code>{processed}</code>\n"
-                        f"✏️ Updated: "
-                        f"<code>{updated}</code>\n"
-                        f"⏭ Skipped: "
-                        f"<code>{skipped}</code>\n"
-                        f"❌ Failed: "
-                        f"<code>{failed}</code>\n\n"
-                        f"📌 Last message ID: "
-                        f"<code>{msg.id}</code>\n\n"
-                        "♻️ Checkpoint saved in MongoDB."
-                    )
-
-                except Exception:
-                    pass
+            # tumhara processing code
+            pass
 
     except Exception as history_exc:
 
-    LOGGER.exception(
-        "Recaption history stopped for channel %s",
-        channel_id
-    )
-
-    error_text = (
-        f"{type(history_exc).__name__}: "
-        f"{str(history_exc)}"
-    )
-
-    try:
-
-        await progress_msg.edit(
-            "⚠️ <b>Recaption paused!</b>\n\n"
-            f"Processed: <code>{processed}</code>\n"
-            f"Updated: <code>{updated}</code>\n"
-            f"Skipped: <code>{skipped}</code>\n"
-            f"Failed: <code>{failed}</code>\n\n"
-            f"Last checkpoint: "
-            f"<code>{last_message_id}</code>\n\n"
-            f"<b>Error:</b>\n"
-            f"<code>{error_text[:3500]}</code>\n\n"
-            "♻️ Progress is saved in MongoDB."
+        LOGGER.exception(
+            "Recaption history stopped for channel %s",
+            channel_id
         )
 
-    except Exception:
-        pass
+        error_text = (
+            f"{type(history_exc).__name__}: "
+            f"{str(history_exc)}"
+        )
 
-    return
+        try:
+            await progress_msg.edit(
+                "⚠️ <b>Recaption paused!</b>\n\n"
+                f"Processed: <code>{processed}</code>\n"
+                f"Updated: <code>{updated}</code>\n"
+                f"Skipped: <code>{skipped}</code>\n"
+                f"Failed: <code>{failed}</code>\n\n"
+                f"<b>Error:</b>\n"
+                f"<code>{error_text[:3500]}</code>\n\n"
+                "♻️ Progress is saved in MongoDB.\n"
+                "Run <code>/recaption_all</code> again to continue."
+            )
+        except Exception:
+            pass
 
+        return
     # -----------------------------------------------------
     # JOB COMPLETED
     # -----------------------------------------------------
