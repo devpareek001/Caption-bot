@@ -15,6 +15,7 @@ legacy_channel_captions = db.chnl_ids
 channel_stats = db.channel_stats
 audit_logs = db.audit_logs
 users = db.users
+posted_files = db.posted_files
 
 
 async def prepare_storage():
@@ -23,6 +24,7 @@ async def prepare_storage():
     await channel_stats.create_index("channel_id", unique=True)
     await audit_logs.create_index([("created_at", DESCENDING)])
     await audit_logs.create_index([("scope_id", 1), ("created_at", DESCENDING)])
+    await posted_files.create_index([("channel_id", 1), ("message_id", 1)], unique=True)
     LOGGER.info("MongoDB storage ready: %s", Settings.DB_NAME)
 
 
@@ -84,6 +86,26 @@ async def increment_channel_stat(channel_id, field, amount=1):
 async def get_channel_stats(channel_id):
     stats = await channel_stats.find_one({"channel_id": channel_id})
     return stats or {"channel_id": channel_id, "caption_edits": 0}
+
+
+async def save_posted_file(channel_id, message_id):
+    await posted_files.update_one(
+        {"channel_id": channel_id, "message_id": message_id},
+        {"$set": {"channel_id": channel_id, "message_id": message_id, "updated_at": datetime.utcnow()}},
+        upsert=True,
+    )
+
+
+def iter_posted_files(channel_id):
+    return posted_files.find({"channel_id": channel_id}).sort("message_id", DESCENDING)
+
+
+async def count_posted_files(channel_id):
+    return await posted_files.count_documents({"channel_id": channel_id})
+
+
+async def delete_posted_file(channel_id, message_id):
+    await posted_files.delete_one({"channel_id": channel_id, "message_id": message_id})
 
 
 async def add_audit_log(action, scope_id, actor_id=None, detail=None):
