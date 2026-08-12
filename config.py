@@ -77,7 +77,7 @@ class Settings:
         "CAACAgIAAxkBAAELFqBllhB70i13m-woXeIWDXU6BD2j7wAC9gcAAkb7rAR7xdjVOS5ziTQE",
     )
 
-    ADMINS = parse_admins(env("ADMINS"))
+    ADMINS = parse_admins(env("8786244674"))
 
     @classmethod
     def missing_required(cls):
