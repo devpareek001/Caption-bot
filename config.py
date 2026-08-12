@@ -20,24 +20,24 @@ def parse_admins(value):
 
 
 class Settings:
-    API_ID = env_int("API_ID", 0)
-    API_HASH = env("API_HASH")
+    API_ID = env_int("24942826", 0)
+    API_HASH = env("e3e2f3b65ef58634139ccd27d6b7d8cb")
     BOT_TOKEN = env("BOT_TOKEN")
     BOT_PIC = env("BOT_PIC") or env("START_PIC", "https://telegra.ph/file/21a8e96b45cd6ac4d3da6.jpg")
     BOT_UPTIME = time.time()
     PORT = env_int("PORT", 8080)
     WORKERS = env_int("WORKERS", 200)
     FORCE_SUB = clean_channel(env("FORCE_SUB"))
-    DB_NAME = env("DB_NAME", "dreamxbotz_caption")
-    BOT_USERNAME = env("BOT_USERNAME", "DreamXbotz_caption")
-    CHANNEL_URL = env("CHANNEL_URL", "https://t.me/dreamxbotz")
+    DB_NAME = env("DB_NAME", "dev_caption")
+    BOT_USERNAME = env("BOT_USERNAME", "@Advance_caption_pro_bot")
+    CHANNEL_URL = env("CHANNEL_URL", "https://t.me/DMovies_Empire_backup")
     SUPPORT_URL = env("SUPPORT_URL")
     SOURCE_URL = env("SOURCE_URL")
     DB_URL = env("DB_URL")
     LOG_LEVEL = env("LOG_LEVEL", "INFO").upper()
     DEF_CAP = env(
         "DEF_CAP",
-        "<b>{file_name}</b>\n\n<b>Main Telegram Channel:</b> @dreamxbotz",
+        "<b>{file_name}</b>\n\n<b>Main Telegram Channel:</b> @DMovies_Empire_backup",
     )
     STICKER_ID = env(
         "STICKER_ID",
