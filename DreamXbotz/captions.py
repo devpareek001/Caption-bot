@@ -7,11 +7,15 @@ from .helpers.keyboards import start_buttons
 from .helpers.logging_setup import get_logger
 from .storage import (
     add_audit_log,
+    count_posted_files,
     delete_channel_caption,
+    delete_posted_file,
     get_channel_caption,
     get_channel_stats,
     increment_channel_stat,
+    iter_posted_files,
     save_channel_caption,
+    save_posted_file,
     save_user,
 )
 from .helpers.telegram import flood_wait_seconds
@@ -41,7 +45,8 @@ async def start_cmd(bot, message):
             f"<b>Hey, {message.from_user.mention}</b>\n\n"
             "I automatically edit captions for videos, audio files, and documents posted in channels.\n\n"
             "Use <code>/set_caption</code> in a channel to set a custom caption.\n"
-            "Use <code>/del_caption</code> in a channel to restore the default caption."
+            "Use <code>/del_caption</code> in a channel to restore the default caption.\n"
+            "Use <code>/recaption_all</code> in a channel (admin only) to update captions on previously posted files too."
         ),
         reply_markup=start_buttons(),
     )
@@ -153,11 +158,105 @@ async def del_caption(_, message):
     asyncio.create_task(delete_messages(message, rep))
 
 
+@Client.on_message(filters.command(["recaption_all", "update_old_captions"]) & filters.channel & filters.user(Settings.ADMINS))
+async def recaption_all(bot, message):
+    channel_id = message.chat.id
+    total = await count_posted_files(channel_id)
+    if not total:
+        rep = await message.reply(
+            "No tracked files found for this channel yet.\n\n"
+            "Only files posted after this update are tracked, so run this again once new files come in."
+        )
+        asyncio.create_task(delete_messages(message, rep))
+        return
+
+    caption_doc = await get_channel_caption(channel_id)
+    template = caption_doc["caption"] if caption_doc else Settings.DEF_CAP
+
+    progress_msg = await message.reply(f"Updating captions for {total} tracked file(s)...\n\nProcessed: 0/{total}")
+    await add_audit_log(
+        "recaption_all_started",
+        channel_id,
+        actor_id=getattr(message.from_user, "id", None),
+        detail={"total": total},
+    )
+
+    updated = skipped = failed = removed = processed = 0
+
+    async for record in iter_posted_files(channel_id):
+        msg_id = record["message_id"]
+        processed += 1
+        old_msg = None
+        new_caption = None
+        try:
+            old_msg = await bot.get_messages(channel_id, msg_id)
+            if not old_msg or old_msg.empty:
+                await delete_posted_file(channel_id, msg_id)
+                removed += 1
+            else:
+                old_file_name = media_file_name(old_msg)
+                if not old_file_name:
+                    await delete_posted_file(channel_id, msg_id)
+                    removed += 1
+                else:
+                    new_caption = render_template(template, old_msg, old_file_name, old_msg.caption)
+                    if old_msg.caption != new_caption:
+                        await old_msg.edit_caption(new_caption)
+                        await increment_channel_stat(channel_id, "caption_edits")
+                        updated += 1
+                    else:
+                        skipped += 1
+            await asyncio.sleep(0.3)
+        except FloodWait as e:
+            await asyncio.sleep(flood_wait_seconds(e))
+            try:
+                if old_msg and new_caption:
+                    await old_msg.edit_caption(new_caption)
+                    await increment_channel_stat(channel_id, "caption_edits")
+                    updated += 1
+            except Exception as exc:
+                LOGGER.warning("Recaption retry failed for %s/%s: %s", channel_id, msg_id, exc)
+                failed += 1
+        except Exception as exc:
+            LOGGER.warning("Recaption failed for %s/%s: %s", channel_id, msg_id, exc)
+            failed += 1
+
+        if processed % 10 == 0 or processed == total:
+            try:
+                await progress_msg.edit(
+                    "Updating captions...\n\n"
+                    f"Processed: {processed}/{total}\n"
+                    f"Updated: {updated}\n"
+                    f"Already correct: {skipped}\n"
+                    f"Removed (deleted messages): {removed}\n"
+                    f"Failed: {failed}"
+                )
+            except Exception:
+                pass
+
+    await add_audit_log(
+        "recaption_all_completed",
+        channel_id,
+        actor_id=getattr(message.from_user, "id", None),
+        detail={"total": total, "updated": updated, "skipped": skipped, "removed": removed, "failed": failed},
+    )
+    await progress_msg.edit(
+        "<u>Recaption completed</u>\n\n"
+        f"Total tracked: {total}\n"
+        f"Updated: {updated}\n"
+        f"Already correct: {skipped}\n"
+        f"Removed (deleted messages): {removed}\n"
+        f"Failed: {failed}"
+    )
+
+
 @Client.on_message(filters.channel)
 async def auto_edit_caption(bot, message):
     file_name = media_file_name(message)
     if not file_name:
         return
+
+    await save_posted_file(message.chat.id, message.id)
 
     caption_doc = await get_channel_caption(message.chat.id)
     template = caption_doc["caption"] if caption_doc else Settings.DEF_CAP
