@@ -941,4 +941,4 @@ async def auto_edit_caption(bot, message):
             "Could not edit caption in channel %s: %s",
             message.chat.id,
             exc
-            )
+    )
