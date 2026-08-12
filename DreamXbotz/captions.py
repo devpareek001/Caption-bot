@@ -377,7 +377,6 @@ async def del_caption(_, message):
         ]
     )
     & filters.channel
-    & filters.user(Settings.ADMINS)
 )
 async def recaption_all(bot, message):
 
