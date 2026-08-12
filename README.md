@@ -1,4 +1,4 @@
-# Dreamxbotz Caption Bot
+# Dev tz Caption Bot
 
 Telegram channel auto-caption bot built with Pyrogram, MongoDB, and aiohttp.
 
