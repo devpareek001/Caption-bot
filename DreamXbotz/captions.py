@@ -736,12 +736,18 @@ async def recaption_all(bot, message):
 
             if processed % 50 == 0:
 
-                    try:
-        # history wala pura code yahan
-        async for msg in bot.get_chat_history(channel_id):
+                try:
 
-            # tumhara processing code
-            pass
+                    await progress_msg.edit(
+                        "⏳ <b>Recaption in progress...</b>\n\n"
+                        f"Processed: <code>{processed}</code>\n"
+                        f"Updated: <code>{updated}</code>\n"
+                        f"Skipped: <code>{skipped}</code>\n"
+                        f"Failed: <code>{failed}</code>"
+                    )
+
+                except Exception:
+                    pass
 
     except Exception as history_exc:
 
@@ -924,4 +930,4 @@ async def auto_edit_caption(bot, message):
             "Could not edit caption in channel %s: %s",
             message.chat.id,
             exc
-    )
+        )
