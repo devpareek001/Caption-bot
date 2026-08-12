@@ -33,7 +33,7 @@ class Settings:
     CHANNEL_URL = env("CHANNEL_URL", "https://t.me/DMovies_Empire_backup")
     SUPPORT_URL = env("SUPPORT_URL")
     SOURCE_URL = env("SOURCE_URL")
-    DB_URL = env("DB_URL")
+    DB_URL = env("mongodb+srv://opkatil1_db_user:caption@cluster0.fows7bk.mongodb.net/?appName=Cluster0")
     LOG_LEVEL = env("LOG_LEVEL", "INFO").upper()
     DEF_CAP = env(
         "DEF_CAP",
