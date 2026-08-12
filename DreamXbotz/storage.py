@@ -6,9 +6,7 @@ from pymongo import DESCENDING
 from config import Settings
 from .helpers.logging_setup import get_logger
 
-
 LOGGER = get_logger("Dreamxbotz.storage")
-
 
 client = motor.motor_asyncio.AsyncIOMotorClient(Settings.DB_URL)
 db = client[Settings.DB_NAME]
@@ -18,28 +16,39 @@ legacy_channel_captions = db.chnl_ids
 channel_stats = db.channel_stats
 audit_logs = db.audit_logs
 users = db.users
-posted_files = db.posted_files
+
+# Recaption progress/checkpoint
+recaption_jobs = db.recaption_jobs
 
 
 async def prepare_storage():
-    # _id index is automatically created and unique by MongoDB.
+    await users.create_index("_id", unique=True)
     await channel_captions.create_index("channel_id", unique=True)
     await channel_stats.create_index("channel_id", unique=True)
     await audit_logs.create_index([("created_at", DESCENDING)])
     await audit_logs.create_index(
         [("scope_id", 1), ("created_at", DESCENDING)]
     )
-    await posted_files.create_index(
-        [("channel_id", 1), ("message_id", 1)],
+
+    # One active recaption job per channel
+    await recaption_jobs.create_index(
+        "channel_id",
         unique=True
     )
 
-    LOGGER.info("MongoDB storage ready: %s", Settings.DB_NAME)
+    LOGGER.info(
+        "MongoDB storage ready: %s",
+        Settings.DB_NAME
+    )
 
 
 def close_storage():
     client.close()
 
+
+# =========================================================
+# USERS
+# =========================================================
 
 async def save_user(user_id):
     await users.update_one(
@@ -60,6 +69,10 @@ def iter_users():
 async def delete_user(user_id):
     await users.delete_one({"_id": user_id})
 
+
+# =========================================================
+# CHANNEL CAPTION
+# =========================================================
 
 async def save_channel_caption(channel_id, caption):
     await channel_captions.update_one(
@@ -114,10 +127,22 @@ async def delete_channel_caption(channel_id):
         {"chnl_id": channel_id}
     )
 
-    return result if result.deleted_count else legacy_result
+    return (
+        result
+        if result.deleted_count
+        else legacy_result
+    )
 
 
-async def increment_channel_stat(channel_id, field, amount=1):
+# =========================================================
+# CHANNEL STATS
+# =========================================================
+
+async def increment_channel_stat(
+    channel_id,
+    field,
+    amount=1
+):
     await channel_stats.update_one(
         {"channel_id": channel_id},
         {
@@ -137,52 +162,18 @@ async def get_channel_stats(channel_id):
         {"channel_id": channel_id}
     )
 
-    return stats or {
-        "channel_id": channel_id,
-        "caption_edits": 0,
-    }
-
-
-async def save_posted_file(channel_id, message_id):
-    await posted_files.update_one(
-        {
+    return (
+        stats
+        or {
             "channel_id": channel_id,
-            "message_id": message_id,
-        },
-        {
-            "$set": {
-                "channel_id": channel_id,
-                "message_id": message_id,
-                "updated_at": datetime.utcnow(),
-            }
-        },
-        upsert=True,
-    )
-
-
-def iter_posted_files(channel_id):
-    return posted_files.find(
-        {"channel_id": channel_id}
-    ).sort(
-        "message_id",
-        DESCENDING
-    )
-
-
-async def count_posted_files(channel_id):
-    return await posted_files.count_documents(
-        {"channel_id": channel_id}
-    )
-
-
-async def delete_posted_file(channel_id, message_id):
-    await posted_files.delete_one(
-        {
-            "channel_id": channel_id,
-            "message_id": message_id,
+            "caption_edits": 0,
         }
     )
 
+
+# =========================================================
+# AUDIT LOG
+# =========================================================
 
 async def add_audit_log(
     action,
@@ -198,4 +189,47 @@ async def add_audit_log(
             "detail": detail or {},
             "created_at": datetime.utcnow(),
         }
+    )
+
+
+# =========================================================
+# RECAPTION CHECKPOINT
+# =========================================================
+
+async def save_recaption_progress(
+    channel_id,
+    last_message_id,
+    caption,
+    processed=0,
+    updated=0,
+    skipped=0,
+    failed=0,
+):
+    await recaption_jobs.update_one(
+        {"channel_id": channel_id},
+        {
+            "$set": {
+                "channel_id": channel_id,
+                "last_message_id": last_message_id,
+                "caption": caption,
+                "processed": processed,
+                "updated": updated,
+                "skipped": skipped,
+                "failed": failed,
+                "updated_at": datetime.utcnow(),
+            }
+        },
+        upsert=True,
+    )
+
+
+async def get_recaption_progress(channel_id):
+    return await recaption_jobs.find_one(
+        {"channel_id": channel_id}
+    )
+
+
+async def clear_recaption_progress(channel_id):
+    await recaption_jobs.delete_one(
+        {"channel_id": channel_id}
     )
