@@ -1,12 +1,14 @@
 import asyncio
 
 from pyrogram import Client, filters
+from pyrogram.enums import ChatMemberStatus, ChatType
 from pyrogram.errors import FloodWait
 
 from config import Settings
 
 from .helpers.caption_tools import (
     media_file_name,
+    parse_message_ref,
     render_template,
     validate_template,
 )
@@ -34,6 +36,125 @@ LOGGER = get_logger("Dreamxbotz.captions")
 
 SAMPLE_FILE_NAME = "Dreamxbotz Movie 2026 Hindi 1080p"
 SAMPLE_CAPTION = "Original upload caption"
+
+
+# =========================================================
+# PM-BASED CHANNEL CONNECTION
+#
+# All admin/management commands are now sent to the bot in
+# PRIVATE chat, not posted in the channel itself. Each user
+# first links a channel with /connect, then every command
+# they send in PM targets that connected channel.
+#
+# In-memory only (per-process) — resets on restart, same as
+# the other in-memory state below. Users just run /connect
+# again if that happens.
+# =========================================================
+
+user_active_channel = {}   # user_id -> channel_id
+
+
+async def get_active_channel(message):
+    """Returns the channel_id the user has connected via
+    /connect, or replies with an error and returns None."""
+
+    channel_id = user_active_channel.get(
+        message.from_user.id
+    )
+
+    if not channel_id:
+
+        await message.reply(
+            "❌ <b>No channel connected.</b>\n\n"
+            "Use <code>/connect @yourchannel</code> "
+            "(or <code>/connect -100xxxxxxxxxx</code>) first.\n\n"
+            "Make sure I'm an admin in that channel and "
+            "that you're an admin there too."
+        )
+        return None
+
+    return channel_id
+
+
+@Client.on_message(
+    filters.command("connect") & filters.private
+)
+async def connect_channel(bot, message):
+
+    if len(message.command) < 2:
+
+        await message.reply(
+            "<b>Connect a channel</b>\n\n"
+            "Usage:\n"
+            "<code>/connect @yourchannel</code>\n"
+            "or\n"
+            "<code>/connect -100xxxxxxxxxx</code>\n\n"
+            "I must already be an admin in that channel, "
+            "and you must be an admin there too.\n\n"
+            "Once connected, all caption commands sent to "
+            "me here in PM will target that channel."
+        )
+        return
+
+    target = message.command[1]
+
+    ADMIN_STATUSES = (
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.OWNER,
+    )
+
+    try:
+        chat = await bot.get_chat(target)
+    except Exception as exc:
+        await message.reply(
+            f"❌ Could not find that channel: <code>{exc}</code>"
+        )
+        return
+
+    if chat.type != ChatType.CHANNEL:
+
+        await message.reply("❌ That's not a channel.")
+        return
+
+    try:
+        member = await bot.get_chat_member(
+            chat.id, message.from_user.id
+        )
+    except Exception:
+        await message.reply(
+            "❌ You must be an admin of that channel."
+        )
+        return
+
+    if member.status not in ADMIN_STATUSES:
+
+        await message.reply(
+            "❌ You must be an admin of that channel."
+        )
+        return
+
+    try:
+        bot_member = await bot.get_chat_member(chat.id, "me")
+        bot_is_admin = bot_member.status in ADMIN_STATUSES
+    except Exception:
+        bot_is_admin = False
+
+    if not bot_is_admin:
+
+        await message.reply(
+            "❌ I need to be an admin in that channel too — "
+            "add me as admin there first."
+        )
+        return
+
+    user_active_channel[message.from_user.id] = chat.id
+
+    await message.reply(
+        f"✅ Connected to <b>{chat.title}</b>.\n\n"
+        "All caption commands sent to me here in PM will "
+        "now target this channel. Run <code>/connect</code> "
+        "again anytime to switch channels."
+    )
 
 
 # =========================================================
@@ -70,13 +191,19 @@ async def start_cmd(bot, message):
             f"<b>Hey, {message.from_user.mention}</b>\n\n"
             "I automatically edit captions for videos, "
             "audio files, and documents posted in channels.\n\n"
-            "Use <code>/set_caption</code> in a channel "
-            "to set a custom caption.\n"
-            "Use <code>/del_caption</code> in a channel "
-            "to restore the default caption.\n"
-            "Use <code>/recaption_all</code> in a channel "
-            "(admin only) to update captions on "
-            "previously posted files too."
+            "<b>Setup:</b>\n"
+            "1️⃣ Add me as admin in your channel.\n"
+            "2️⃣ Here in PM, run "
+            "<code>/connect @yourchannel</code>.\n\n"
+            "After that, all commands are sent to me here "
+            "in PM (not in the channel):\n"
+            "<code>/set_caption</code> — set a custom caption\n"
+            "<code>/del_caption</code> — restore the default\n"
+            "<code>/recaption_all</code> — update captions on "
+            "previously posted files too (admin only)\n"
+            "<code>/recaption_range</code> — recaption a "
+            "custom message range\n"
+            "<code>/stop_recaption</code> — stop a running job"
         ),
         reply_markup=start_buttons(),
     )
@@ -87,13 +214,17 @@ async def start_cmd(bot, message):
 # =========================================================
 
 @Client.on_message(
-    filters.command("set_caption") & filters.channel
+    filters.command("set_caption") & filters.private
 )
 async def set_caption(bot, message):
 
+    channel_id = await get_active_channel(message)
+    if channel_id is None:
+        return
+
     if len(message.command) < 2:
 
-        rep = await message.reply(
+        await message.reply(
             "Usage:\n"
             "<code>/set_caption {file_name}</code>\n\n"
             "Available placeholders:\n"
@@ -106,10 +237,6 @@ async def set_caption(bot, message):
             "<code>{duration}</code>\n"
             "<code>{season}</code>\n"
             "<code>{episode}</code>"
-        )
-
-        asyncio.create_task(
-            delete_messages(message, rep)
         )
         return
 
@@ -124,25 +251,21 @@ async def set_caption(bot, message):
 
     if not is_valid:
 
-        rep = await message.reply(
+        await message.reply(
             f"Unknown placeholder(s): "
             f"<code>{invalid_fields}</code>\n\n"
             "Use only allowed placeholders."
         )
-
-        asyncio.create_task(
-            delete_messages(message, rep)
-        )
         return
 
     await save_channel_caption(
-        message.chat.id,
+        channel_id,
         caption
     )
 
     await add_audit_log(
         "caption_saved",
-        message.chat.id,
+        channel_id,
         actor_id=getattr(
             message.from_user,
             "id",
@@ -153,13 +276,9 @@ async def set_caption(bot, message):
         },
     )
 
-    rep = await message.reply(
+    await message.reply(
         "Caption saved successfully.\n\n"
         f"New caption:\n<code>{caption}</code>"
-    )
-
-    asyncio.create_task(
-        delete_messages(message, rep)
     )
 
 
@@ -168,9 +287,13 @@ async def set_caption(bot, message):
 # =========================================================
 
 @Client.on_message(
-    filters.command("caption_preview") & filters.channel
+    filters.command("caption_preview") & filters.private
 )
 async def caption_preview(bot, message):
+
+    channel_id = await get_active_channel(message)
+    if channel_id is None:
+        return
 
     template = (
         message.text.split(" ", 1)[1].strip()
@@ -181,7 +304,7 @@ async def caption_preview(bot, message):
     if not template:
 
         caption_doc = await get_channel_caption(
-            message.chat.id
+            channel_id
         )
 
         template = (
@@ -196,13 +319,9 @@ async def caption_preview(bot, message):
 
     if not is_valid:
 
-        rep = await message.reply(
+        await message.reply(
             f"Template error: "
             f"<code>{invalid_fields}</code>"
-        )
-
-        asyncio.create_task(
-            delete_messages(message, rep)
         )
         return
 
@@ -213,12 +332,8 @@ async def caption_preview(bot, message):
         SAMPLE_CAPTION
     )
 
-    rep = await message.reply(
+    await message.reply(
         f"<b>Caption preview</b>\n\n{preview}"
-    )
-
-    asyncio.create_task(
-        delete_messages(message, rep)
     )
 
 
@@ -227,11 +342,11 @@ async def caption_preview(bot, message):
 # =========================================================
 
 @Client.on_message(
-    filters.command("caption_vars") & filters.channel
+    filters.command("caption_vars") & filters.private
 )
 async def caption_vars(bot, message):
 
-    rep = await message.reply(
+    await message.reply(
         "<b>Available caption placeholders</b>\n\n"
         "<code>{file_name}</code> - cleaned file name\n"
         "<code>{caption}</code> - original caption or file name\n"
@@ -244,22 +359,22 @@ async def caption_vars(bot, message):
         "<code>{episode}</code> - episode number"
     )
 
-    asyncio.create_task(
-        delete_messages(message, rep)
-    )
-
 
 # =========================================================
 # CHANNEL SETTINGS
 # =========================================================
 
 @Client.on_message(
-    filters.command("settings") & filters.channel
+    filters.command("settings") & filters.private
 )
 async def channel_settings(bot, message):
 
+    channel_id = await get_active_channel(message)
+    if channel_id is None:
+        return
+
     caption_doc = await get_channel_caption(
-        message.chat.id
+        channel_id
     )
 
     template = (
@@ -274,14 +389,10 @@ async def channel_settings(bot, message):
         else "default"
     )
 
-    rep = await message.reply(
+    await message.reply(
         "<b>Channel settings</b>\n\n"
         f"<b>Caption mode:</b> <code>{mode}</code>\n"
         f"<b>Template:</b>\n<code>{template}</code>"
-    )
-
-    asyncio.create_task(
-        delete_messages(message, rep)
     )
 
 
@@ -290,22 +401,22 @@ async def channel_settings(bot, message):
 # =========================================================
 
 @Client.on_message(
-    filters.command("channel_stats") & filters.channel
+    filters.command("channel_stats") & filters.private
 )
 async def channel_stats(bot, message):
 
+    channel_id = await get_active_channel(message)
+    if channel_id is None:
+        return
+
     stats = await get_channel_stats(
-        message.chat.id
+        channel_id
     )
 
-    rep = await message.reply(
+    await message.reply(
         "<b>Channel stats</b>\n\n"
         f"<b>Caption edits:</b> "
         f"<code>{stats.get('caption_edits', 0)}</code>"
-    )
-
-    asyncio.create_task(
-        delete_messages(message, rep)
     )
 
 
@@ -321,19 +432,23 @@ async def channel_stats(bot, message):
             "delete_caption"
         ]
     )
-    & filters.channel
+    & filters.private
 )
-async def del_caption(_, message):
+async def del_caption(bot, message):
+
+    channel_id = await get_active_channel(message)
+    if channel_id is None:
+        return
 
     result = await delete_channel_caption(
-        message.chat.id
+        channel_id
     )
 
     if result.deleted_count:
 
         await add_audit_log(
             "caption_deleted",
-            message.chat.id,
+            channel_id,
             actor_id=getattr(
                 message.from_user,
                 "id",
@@ -378,7 +493,7 @@ async def del_caption(_, message):
 # =========================================================
 
 GET_MESSAGES_CHUNK = 200        # IDs fetched per get_messages call
-PROGRESS_UPDATE_EVERY = 5       # update progress message every N chunks
+PROGRESS_UPDATE_EVERY = 1       # update progress message every N chunks (live)
 
 # In-memory (per-process) state.
 # Stop flags and the range-flow Q&A are per-channel and
@@ -386,7 +501,7 @@ PROGRESS_UPDATE_EVERY = 5       # update progress message every N chunks
 # still lets /recaption_all resume a stopped/interrupted job.
 
 recaption_stop_flags = {}     # channel_id -> True (stop requested)
-recaption_range_state = {}    # channel_id -> {"stage": ..., "top_id": _id": ...}
+recaption_range_state = {}    # user_id -> {"stage": ..., "channel_id": ..., "top_id": ...}
 async def execute_recaption_job(
     bot,
     channel_id,
@@ -496,17 +611,26 @@ async def execute_recaption_job(
 
                     skipped += 1
 
-                elif msg.caption == target_caption:
-
-                    skipped += 1
-
                 else:
 
-                    await msg.edit_caption(
-                        target_caption
+                    rendered_caption = render_template(
+                        target_caption,
+                        msg,
+                        file_name,
+                        msg.caption
                     )
 
-                    updated += 1
+                    if msg.caption == rendered_caption:
+
+                        skipped += 1
+
+                    else:
+
+                        await msg.edit_caption(
+                            rendered_caption
+                        )
+
+                        updated += 1
 
                     try:
                         await increment_channel_stat(
@@ -533,10 +657,21 @@ async def execute_recaption_job(
 
                 try:
 
-                    if file_name and msg.caption != target_caption:
+                    retry_caption = (
+                        render_template(
+                            target_caption,
+                            msg,
+                            file_name,
+                            msg.caption
+                        )
+                        if file_name
+                        else None
+                    )
+
+                    if file_name and msg.caption != retry_caption:
 
                         await msg.edit_caption(
-                            target_caption
+                            retry_caption
                         )
                         updated += 1
 
@@ -674,24 +809,22 @@ async def execute_recaption_job(
 # =========================================================
 
 @Client.on_message(
-    filters.command("stop_recaption") & filters.channel
+    filters.command("stop_recaption") & filters.private
 )
 async def stop_recaption(bot, message):
 
-    channel_id = message.chat.id
+    channel_id = await get_active_channel(message)
+    if channel_id is None:
+        return
 
     recaption_stop_flags[channel_id] = True
 
-    rep = await message.reply(
+    await message.reply(
         "🛑 <b>Stop requested.</b>\n\n"
         "The running recaption job will stop after "
         "finishing its current batch.\n\n"
         "Progress is saved — run <code>/recaption_all</code> "
         "anytime to resume from where it stopped."
-    )
-
-    asyncio.create_task(
-        delete_messages(message, rep)
     )
 
 
@@ -700,18 +833,17 @@ async def stop_recaption(bot, message):
 # =========================================================
 
 @Client.on_message(
-    filters.command("cancel") & filters.channel
+    filters.command("cancel") & filters.private
 )
 async def cancel_range_flow(bot, message):
 
-    channel_id = message.chat.id
+    user_id = message.from_user.id
 
-    if channel_id in recaption_range_state:
+    if user_id in recaption_range_state:
 
-        recaption_range_state.pop(channel_id, None)
+        recaption_range_state.pop(user_id, None)
 
-        rep = await message.reply("❌ Cancelled.")
-        asyncio.create_task(delete_messages(message, rep))
+        await message.reply("❌ Cancelled.")
 
 
 # =========================================================
@@ -722,42 +854,57 @@ async def cancel_range_flow(bot, message):
 # Interactive flow — bot asks for the TOP message ID,
 # then the BOTTOM message ID, then the new caption,
 # and scans only that range.
+#
+# Sent in PM. State is keyed by the requesting user's ID
+# and carries the connected channel_id along with it.
 # =========================================================
 
 @Client.on_message(
-    filters.command("recaption_range") & filters.channel
+    filters.command("recaption_range") & filters.private
 )
 async def recaption_range_start(bot, message):
 
-    channel_id = message.chat.id
+    channel_id = await get_active_channel(message)
+    if channel_id is None:
+        return
 
-    recaption_range_state[channel_id] = {
+    user_id = message.from_user.id
+
+    recaption_range_state[user_id] = {
         "stage": "top",
-        "requested_by": getattr(message.from_user, "id", None),
+        "channel_id": channel_id,
+        "requested_by": user_id,
     }
 
     await message.reply(
         "<b>Custom range recaption</b>\n\n"
-        "Send the <b>TOP</b> message ID "
-        "(the newer / higher one) to start from.\n\n"
+        "Send the <b>TOP</b> message — either its numeric ID "
+        "or its Telegram message link "
+        "(e.g. <code>https://t.me/c/12345/678</code>) — "
+        "the newer / higher one, to start from.\n\n"
         "Send <code>/cancel</code> anytime to cancel."
     )
 
 
 @Client.on_message(
-    filters.channel
+    filters.private
     & filters.text
     & filters.create(
-        lambda _, __, m: m.chat.id in recaption_range_state
+        lambda _, __, m: (
+            m.from_user
+            and m.from_user.id in recaption_range_state
+        )
     )
 )
 async def recaption_range_collect(bot, message):
 
-    channel_id = message.chat.id
-    state = recaption_range_state.get(channel_id)
+    user_id = message.from_user.id
+    state = recaption_range_state.get(user_id)
 
     if not state:
         return
+
+    channel_id = state["channel_id"]
 
     text = (message.text or "").strip()
 
@@ -767,18 +914,21 @@ async def recaption_range_collect(bot, message):
 
     if state["stage"] == "top":
 
-        if not text.isdigit():
+        top_id = parse_message_ref(text)
+
+        if top_id is None:
             await message.reply(
-                "❌ Please send a valid numeric message ID."
+                "❌ Please send a valid message ID or "
+                "Telegram message link."
             )
             return
 
-        state["top_id"] = int(text)
+        state["top_id"] = top_id
         state["stage"] = "bottom"
 
         await message.reply(
-            "Got it. Now send the <b>BOTTOM</b> message ID "
-            "(the older / lower one) to stop at."
+            "Got it. Now send the <b>BOTTOM</b> message — "
+            "ID or link — (the older / lower one) to stop at."
         )
         return
 
@@ -788,13 +938,15 @@ async def recaption_range_collect(bot, message):
 
     if state["stage"] == "bottom":
 
-        if not text.isdigit():
+        bottom_id = parse_message_ref(text)
+
+        if bottom_id is None:
             await message.reply(
-                "❌ Please send a valid numeric message ID."
+                "❌ Please send a valid message ID or "
+                "Telegram message link."
             )
             return
 
-        bottom_id = int(text)
         top_id = state["top_id"]
 
         if bottom_id > top_id:
@@ -831,10 +983,22 @@ async def recaption_range_collect(bot, message):
             )
             return
 
+        is_valid, invalid_fields = validate_template(
+            caption
+        )
+
+        if not is_valid:
+            await message.reply(
+                f"❌ Unknown placeholder(s): "
+                f"<code>{invalid_fields}</code>\n\n"
+                "Use only allowed placeholders."
+            )
+            return
+
         top_id = state["top_id"]
         bottom_id = state["bottom_id"]
 
-        recaption_range_state.pop(channel_id, None)
+        recaption_range_state.pop(user_id, None)
 
         await add_audit_log(
             "recaption_range_started",
@@ -896,11 +1060,13 @@ async def recaption_range_collect(bot, message):
             "update_old_captions"
         ]
     )
-    & filters.channel
+    & filters.private
 )
 async def recaption_all(bot, message):
 
-    channel_id = message.chat.id
+    channel_id = await get_active_channel(message)
+    if channel_id is None:
+        return
 
     old_job = await get_recaption_progress(
         channel_id
@@ -908,7 +1074,7 @@ async def recaption_all(bot, message):
 
     if len(message.command) < 2 and not old_job:
 
-        rep = await message.reply(
+        await message.reply(
             "<b>Usage:</b>\n\n"
             "<code>/recaption_all YOUR NEW CAPTION</code>\n\n"
             "<b>Example:</b>\n"
@@ -920,10 +1086,6 @@ async def recaption_all(bot, message):
             "<code>/recaption_range</code>.\n"
             "To stop a running job, use "
             "<code>/stop_recaption</code>."
-        )
-
-        asyncio.create_task(
-            delete_messages(message, rep)
         )
         return
 
@@ -961,6 +1123,25 @@ async def recaption_all(bot, message):
         )
         return
 
+    if command_caption:
+
+        is_valid, invalid_fields = validate_template(
+            command_caption
+        )
+
+        if not is_valid:
+
+            rep = await message.reply(
+                f"❌ Unknown placeholder(s): "
+                f"<code>{invalid_fields}</code>\n\n"
+                "Use only allowed placeholders."
+            )
+
+            asyncio.create_task(
+                delete_messages(message, rep)
+            )
+            return
+
     if old_job:
 
         target_caption = old_job.get(
@@ -991,7 +1172,24 @@ async def recaption_all(bot, message):
     else:
 
         target_caption = command_caption
-        start_id = message.id - 1
+
+        # We're in PM now, so message.id belongs to this PM
+        # chat, not the channel. Ping the channel with a
+        # throwaway message to learn its current latest
+        # message ID, then delete the ping.
+        try:
+            probe = await bot.send_message(channel_id, "🔄")
+            start_id = probe.id - 1
+            await probe.delete()
+        except Exception as exc:
+            await message.reply(
+                "❌ Could not access the connected channel "
+                f"to find its latest message: <code>{exc}</code>\n\n"
+                "Make sure I'm still an admin there with "
+                "permission to post and delete messages."
+            )
+            return
+
         floor_id = 1
 
         processed = 0
@@ -1162,4 +1360,4 @@ async def auto_edit_caption(bot, message):
             "Could not edit caption in channel %s: %s",
             message.chat.id,
             exc
-            )
+    )
