@@ -34,10 +34,6 @@ users = db.users
 
 async def prepare_storage():
 
-    # IMPORTANT:
-    # Do NOT create an index on users._id.
-    # MongoDB already creates a unique _id index automatically.
-
     await channel_captions.create_index(
         "channel_id",
         unique=True
@@ -151,11 +147,6 @@ async def get_channel_caption(channel_id):
 
     if caption:
         return caption
-
-
-    # -----------------------------------------------------
-    # Check old/legacy caption collection
-    # -----------------------------------------------------
 
     legacy_caption = await legacy_channel_captions.find_one(
         {
@@ -275,19 +266,14 @@ async def add_audit_log(
 # =========================================================
 # RECAPTION CHECKPOINT
 #
-# IMPORTANT:
-# We use EXISTING audit_logs collection.
-#
-# No new collection.
-# No new index.
-# No 2 lakh files stored in DB.
-#
-# Only ONE small checkpoint document is stored.
+# Uses ID-range scanning (bot.get_messages with known IDs)
+# instead of get_chat_history, because Telegram blocks
+# get_chat_history for bot accounts (BOT_METHOD_INVALID).
 # =========================================================
 
 async def save_recaption_progress(
     channel_id,
-    last_message_id,
+    next_id,
     caption,
     processed=0,
     updated=0,
@@ -305,7 +291,7 @@ async def save_recaption_progress(
                 "action": "recaption_checkpoint",
                 "scope_id": channel_id,
                 "detail": {
-                    "last_message_id": last_message_id,
+                    "next_id": next_id,
                     "caption": caption,
                     "processed": processed,
                     "updated": updated,
@@ -323,12 +309,19 @@ async def get_recaption_progress(
     channel_id
 ):
 
-    return await audit_logs.find_one(
+    doc = await audit_logs.find_one(
         {
             "action": "recaption_checkpoint",
             "scope_id": channel_id,
         }
     )
+
+    if not doc:
+        return None
+
+    detail = doc.get("detail", {})
+    detail["channel_id"] = channel_id
+    return detail
 
 
 async def clear_recaption_progress(
