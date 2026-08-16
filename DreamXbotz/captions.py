@@ -362,12 +362,25 @@ async def del_caption(_, message):
 #
 # /recaption_all NEW CAPTION
 #
-# - Scans Telegram channel history directly
-# - Does NOT depend on old DB file records
-# - Completely replaces old captions
-# - Saves checkpoint in MongoDB
-# - Resumes after restart
+# HOW THIS WORKS (bot-token friendly):
+# Telegram blocks bots from using get_chat_history
+# (BOT_METHOD_INVALID). But bots CAN fetch specific
+# known message IDs using get_messages(channel_id, [ids]).
+#
+# Channel message IDs are just sequential numbers, so we
+# scan backwards from the latest ID to ID 1 in chunks,
+# fetching each chunk with get_messages and editing any
+# file captions we find. No userbot needed.
+#
+# - No cap: scans everything down to message ID 1 in one run
+# - Saves checkpoint in MongoDB after every chunk (crash safety)
+# - If interrupted, run the command again to resume
 # =========================================================
+
+RECAPTION_BATCH_LIMIT = None    # no cap — personal bot, scans everything in one run
+GET_MESSAGES_CHUNK = 200        # IDs fetched per get_messages call
+PROGRESS_UPDATE_EVERY = 5       # update progress message every N chunks
+
 
 @Client.on_message(
     filters.command(
@@ -391,50 +404,38 @@ async def recaption_all(bot, message):
     )
 
     # -----------------------------------------------------
-    # New caption
+    # New caption / usage text
     # -----------------------------------------------------
 
-    if len(message.command) < 2:
+    if len(message.command) < 2 and not old_job:
 
-        if old_job:
-
-            saved_caption = old_job.get(
-                "caption",
-                ""
-            )
-
-            rep = await message.reply(
-                "⏳ <b>Previous recaption job found.</b>\n\n"
-                f"Caption:\n<code>{saved_caption}</code>\n\n"
-                f"Last message ID: "
-                f"<code>{old_job.get('last_message_id')}</code>\n\n"
-                "The job will continue automatically "
-                "from the saved checkpoint when you run "
-                "<code>/recaption_all</code>."
-            )
-
-        else:
-
-            rep = await message.reply(
-                "<b>Usage:</b>\n\n"
-                "<code>/recaption_all YOUR NEW CAPTION</code>\n\n"
-                "<b>Example:</b>\n"
-                "<code>/recaption_all "
-                "🔥 Dreamxbotz Movies 🔥</code>\n\n"
-                "The old caption will be completely replaced."
-            )
+        rep = await message.reply(
+            "<b>Usage:</b>\n\n"
+            "<code>/recaption_all YOUR NEW CAPTION</code>\n\n"
+            "<b>Example:</b>\n"
+            "<code>/recaption_all "
+            "🔥 Dreamxbotz Movies 🔥</code>\n\n"
+            "The old caption will be completely replaced.\n"
+            "This scans all old files in one run "
+            "(may take a while for large channels)."
+        )
 
         asyncio.create_task(
             delete_messages(message, rep)
         )
         return
 
-    command_caption = message.text.split(
-        " ",
-        1
-    )[1].strip()
+    if len(message.command) >= 2:
 
-    if not command_caption:
+        command_caption = message.text.split(
+            " ",
+            1
+        )[1].strip()
+
+    else:
+        command_caption = None
+
+    if command_caption is not None and not command_caption:
 
         rep = await message.reply(
             "❌ New caption cannot be empty."
@@ -445,7 +446,7 @@ async def recaption_all(bot, message):
         )
         return
 
-    if len(command_caption) > 1024:
+    if command_caption and len(command_caption) > 1024:
 
         rep = await message.reply(
             "❌ Caption is too long.\n\n"
@@ -459,10 +460,8 @@ async def recaption_all(bot, message):
         return
 
     # -----------------------------------------------------
-    # If checkpoint exists, ALWAYS use its caption.
-    #
-    # This prevents accidentally changing the caption
-    # halfway through an existing 2 lakh file job.
+    # If checkpoint exists, ALWAYS use its caption
+    # and resume from its saved position.
     # -----------------------------------------------------
 
     if old_job:
@@ -472,8 +471,8 @@ async def recaption_all(bot, message):
             command_caption
         )
 
-        last_message_id = old_job.get(
-            "last_message_id"
+        start_id = old_job.get(
+            "next_id"
         )
 
         processed = old_job.get(
@@ -498,15 +497,18 @@ async def recaption_all(bot, message):
 
         resume_text = (
             "♻️ <b>Resuming previous job...</b>\n\n"
-            f"Starting after message ID: "
-            f"<code>{last_message_id}</code>"
+            f"Continuing down from message ID: "
+            f"<code>{start_id}</code>"
         )
 
     else:
 
         target_caption = command_caption
 
-        last_message_id = None
+        # The command itself was just sent in this channel,
+        # so its own ID is at (or very near) the latest
+        # sequential message ID for this channel.
+        start_id = message.id - 1
 
         processed = 0
         updated = 0
@@ -514,24 +516,10 @@ async def recaption_all(bot, message):
         failed = 0
 
         resume_text = (
-            "🚀 <b>Starting new recaption job...</b>"
+            "🚀 <b>Starting new recaption job...</b>\n\n"
+            f"Scanning downward from message ID: "
+            f"<code>{start_id}</code>"
         )
-
-    # -----------------------------------------------------
-    # Progress message
-    # -----------------------------------------------------
-
-    progress_msg = await message.reply(
-        f"{resume_text}\n\n"
-        f"<b>Target caption:</b>\n"
-        f"<code>{target_caption}</code>\n\n"
-        f"Processed: <code>{processed}</code>\n"
-        f"Updated: <code>{updated}</code>\n"
-        f"Skipped: <code>{skipped}</code>\n"
-        f"Failed: <code>{failed}</code>"
-    )
-
-    if not old_job:
 
         await add_audit_log(
             "recaption_all_started",
@@ -543,32 +531,116 @@ async def recaption_all(bot, message):
             ),
             detail={
                 "caption": target_caption,
-                "mode": "telegram_history",
+                "start_id": start_id,
+                "mode": "id_range_scan",
             },
         )
 
+    if not start_id or start_id < 1:
+
+        await clear_recaption_progress(channel_id)
+
+        rep = await message.reply(
+            "✅ Nothing left to scan (reached message ID 1)."
+        )
+
+        asyncio.create_task(
+            delete_messages(message, rep)
+        )
+        return
+
     # -----------------------------------------------------
-    # Telegram history
-    #
-    # If checkpoint exists, offset_id starts us around
-    # the previous message instead of scanning everything.
+    # Progress message
     # -----------------------------------------------------
 
-    history_kwargs = {}
+    progress_msg = await message.reply(
+        f"{resume_text}\n\n"
+        f"<b>Target caption:</b>\n"
+        f"<code>{target_caption}</code>\n\n"
+        f"Processed so far: <code>{processed}</code>\n"
+        f"Updated: <code>{updated}</code>\n"
+        f"Skipped: <code>{skipped}</code>\n"
+        f"Failed: <code>{failed}</code>"
+    )
 
-    if last_message_id:
-        history_kwargs["offset_id"] = last_message_id
+    current_id = start_id
+    chunk_count = 0
 
-    try:
+    # -----------------------------------------------------
+    # Scan backwards in chunks using get_messages
+    # (bot-token safe — no get_chat_history involved)
+    # Runs all the way down to message ID 1 in one go.
+    # -----------------------------------------------------
 
-        async for msg in bot.get_chat_history(
-            channel_id,
-            **history_kwargs
-        ):
+    while current_id >= 1:
 
-            # -------------------------------------------------
-            # Safety: don't process service messages etc.
-            # -------------------------------------------------
+        take = min(
+            GET_MESSAGES_CHUNK,
+            current_id
+        )
+
+        chunk_ids = list(
+            range(
+                current_id - take + 1,
+                current_id + 1
+            )
+        )
+
+        try:
+
+            messages = await bot.get_messages(
+                channel_id,
+                chunk_ids
+            )
+
+        except FloodWait as e:
+
+            wait_time = flood_wait_seconds(e)
+
+            LOGGER.warning(
+                "FloodWait fetching chunk ending at %s. "
+                "Sleeping %s seconds.",
+                current_id,
+                wait_time,
+            )
+
+            await asyncio.sleep(wait_time)
+
+            try:
+                messages = await bot.get_messages(
+                    channel_id,
+                    chunk_ids
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "Chunk fetch retry failed at %s: %s",
+                    current_id,
+                    exc
+                )
+                messages = []
+
+        except Exception as exc:
+
+            LOGGER.warning(
+                "Chunk fetch failed at %s: %s",
+                current_id,
+                exc
+            )
+            messages = []
+
+        # Pyrogram returns messages in the same order as
+        # chunk_ids (ascending). Missing/deleted messages
+        # come back as empty Message objects.
+
+        for msg in messages:
+
+            if not msg or getattr(msg, "empty", False):
+                continue
+
+            if getattr(msg, "service", False):
+                continue
+
+            processed += 1
 
             try:
 
@@ -581,36 +653,17 @@ async def recaption_all(bot, message):
                     msg.id,
                     exc
                 )
-
                 file_name = None
 
-            # -------------------------------------------------
-            # Process message
-            # -------------------------------------------------
-
-            processed += 1
-
             try:
-
-                # ---------------------------------------------
-                # No media/file
-                # ---------------------------------------------
 
                 if not file_name:
 
                     skipped += 1
 
-                # ---------------------------------------------
-                # Caption already same
-                # ---------------------------------------------
-
                 elif msg.caption == target_caption:
 
                     skipped += 1
-
-                # ---------------------------------------------
-                # Replace COMPLETE caption
-                # ---------------------------------------------
 
                 else:
 
@@ -621,16 +674,13 @@ async def recaption_all(bot, message):
                     updated += 1
 
                     try:
-
                         await increment_channel_stat(
                             channel_id,
                             "caption_edits"
                         )
-
                     except Exception:
                         pass
 
-                    # Small delay to reduce FloodWait
                     await asyncio.sleep(0.35)
 
             except FloodWait as e:
@@ -638,45 +688,33 @@ async def recaption_all(bot, message):
                 wait_time = flood_wait_seconds(e)
 
                 LOGGER.warning(
-                    "FloodWait on message %s. "
+                    "FloodWait editing message %s. "
                     "Sleeping %s seconds.",
                     msg.id,
                     wait_time,
                 )
 
-                await asyncio.sleep(
-                    wait_time
-                )
-
-                # ---------------------------------------------
-                # Retry
-                # ---------------------------------------------
+                await asyncio.sleep(wait_time)
 
                 try:
 
-                    if file_name:
+                    if file_name and msg.caption != target_caption:
 
-                        if msg.caption != target_caption:
+                        await msg.edit_caption(
+                            target_caption
+                        )
+                        updated += 1
 
-                            await msg.edit_caption(
-                                target_caption
+                        try:
+                            await increment_channel_stat(
+                                channel_id,
+                                "caption_edits"
                             )
+                        except Exception:
+                            pass
 
-                            updated += 1
-
-                            try:
-
-                                await increment_channel_stat(
-                                    channel_id,
-                                    "caption_edits"
-                                )
-
-                            except Exception:
-                                pass
-
-                        else:
-
-                            skipped += 1
+                    else:
+                        skipped += 1
 
                 except Exception as retry_exc:
 
@@ -693,92 +731,62 @@ async def recaption_all(bot, message):
                 failed += 1
 
                 LOGGER.warning(
-                    "Recaption failed for "
-                    "%s/%s: %s",
+                    "Recaption failed for %s/%s: %s",
                     channel_id,
                     msg.id,
                     exc,
                 )
 
-            # -------------------------------------------------
-            # SAVE CHECKPOINT
-            #
-            # Save AFTER processing this message.
-            #
-            # If bot crashes:
-            # it will continue from this message.
-            # -------------------------------------------------
+        current_id -= take
+        chunk_count += 1
+
+        # ---------------------------------------------
+        # Save checkpoint after every chunk (crash safety)
+        # ---------------------------------------------
+
+        try:
+
+            await save_recaption_progress(
+                channel_id=channel_id,
+                next_id=current_id,
+                caption=target_caption,
+                processed=processed,
+                updated=updated,
+                skipped=skipped,
+                failed=failed,
+            )
+
+        except Exception as checkpoint_exc:
+
+            LOGGER.warning(
+                "Could not save checkpoint at %s: %s",
+                current_id,
+                checkpoint_exc,
+            )
+
+        # ---------------------------------------------
+        # Progress update (every few chunks, to avoid
+        # editing the progress message too often)
+        # ---------------------------------------------
+
+        if chunk_count % PROGRESS_UPDATE_EVERY == 0:
 
             try:
 
-                await save_recaption_progress(
-                    channel_id=channel_id,
-                    last_message_id=msg.id,
-                    caption=target_caption,
-                    processed=processed,
-                    updated=updated,
-                    skipped=skipped,
-                    failed=failed,
+                await progress_msg.edit(
+                    "⏳ <b>Recaption in progress...</b>\n\n"
+                    f"Processed: <code>{processed}</code>\n"
+                    f"Updated: <code>{updated}</code>\n"
+                    f"Skipped: <code>{skipped}</code>\n"
+                    f"Failed: <code>{failed}</code>\n\n"
+                    f"Currently at message ID: <code>{current_id}</code>"
                 )
 
-            except Exception as checkpoint_exc:
+            except Exception:
+                pass
 
-                LOGGER.warning(
-                    "Could not save checkpoint "
-                    "for %s: %s",
-                    msg.id,
-                    checkpoint_exc,
-                )
-
-            # -------------------------------------------------
-            # Progress update
-            # -------------------------------------------------
-
-            if processed % 50 == 0:
-
-                try:
-
-                    await progress_msg.edit(
-                        "⏳ <b>Recaption in progress...</b>\n\n"
-                        f"Processed: <code>{processed}</code>\n"
-                        f"Updated: <code>{updated}</code>\n"
-                        f"Skipped: <code>{skipped}</code>\n"
-                        f"Failed: <code>{failed}</code>"
-                    )
-
-                except Exception:
-                    pass
-
-    except Exception as history_exc:
-
-        LOGGER.exception(
-            "Recaption history stopped for channel %s",
-            channel_id
-        )
-
-        error_text = (
-            f"{type(history_exc).__name__}: "
-            f"{str(history_exc)}"
-        )
-
-        try:
-            await progress_msg.edit(
-                "⚠️ <b>Recaption paused!</b>\n\n"
-                f"Processed: <code>{processed}</code>\n"
-                f"Updated: <code>{updated}</code>\n"
-                f"Skipped: <code>{skipped}</code>\n"
-                f"Failed: <code>{failed}</code>\n\n"
-                f"<b>Error:</b>\n"
-                f"<code>{error_text[:3500]}</code>\n\n"
-                "♻️ Progress is saved in MongoDB.\n"
-                "Run <code>/recaption_all</code> again to continue."
-            )
-        except Exception:
-            pass
-
-        return
     # -----------------------------------------------------
-    # JOB COMPLETED
+    # Job fully completed (current_id reached 0)
     # -----------------------------------------------------
 
     await add_audit_log(
@@ -798,10 +806,6 @@ async def recaption_all(bot, message):
         },
     )
 
-    # -----------------------------------------------------
-    # Remove checkpoint ONLY after complete success
-    # -----------------------------------------------------
-
     await clear_recaption_progress(
         channel_id
     )
@@ -810,14 +814,10 @@ async def recaption_all(bot, message):
 
         await progress_msg.edit(
             "✅ <b>Recaption completed!</b>\n\n"
-            f"📨 Messages scanned: "
-            f"<code>{processed}</code>\n"
-            f"✏️ Captions updated: "
-            f"<code>{updated}</code>\n"
-            f"⏭ Skipped: "
-            f"<code>{skipped}</code>\n"
-            f"❌ Failed: "
-            f"<code>{failed}</code>\n\n"
+            f"📨 Messages scanned: <code>{processed}</code>\n"
+            f"✏️ Captions updated: <code>{updated}</code>\n"
+            f"⏭ Skipped: <code>{skipped}</code>\n"
+            f"❌ Failed: <code>{failed}</code>\n\n"
             "🎉 All available old files have been processed.\n\n"
             "♻️ Checkpoint removed from MongoDB."
         )
@@ -930,4 +930,4 @@ async def auto_edit_caption(bot, message):
             "Could not edit caption in channel %s: %s",
             message.chat.id,
             exc
-        )
+            )
