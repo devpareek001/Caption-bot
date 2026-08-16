@@ -120,6 +120,25 @@ def trim_caption(caption):
     return caption[: TELEGRAM_CAPTION_LIMIT - 3].rstrip() + "..."
 
 
+MESSAGE_LINK_PATTERN = re.compile(r"(\d+)/?$")
+
+
+def parse_message_ref(text):
+    """Accepts either a plain numeric message ID or a Telegram
+    message link (e.g. https://t.me/c/12345/678 or
+    https://t.me/channelname/678) and returns the integer
+    message ID, or None if it can't be parsed."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    match = MESSAGE_LINK_PATTERN.search(text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
 def media_file_name(message):
     for file_type in ("video", "audio", "document", "voice"):
         media = getattr(message, file_type, None)
