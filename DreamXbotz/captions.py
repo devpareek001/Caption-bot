@@ -358,9 +358,8 @@ async def del_caption(_, message):
 
 
 # =========================================================
-# RECAPTION ALL
-#
-# /recaption_all NEW CAPTION
+# RECAPTION ENGINE (shared by /recaption_all and
+# /recaption_range)
 #
 # HOW THIS WORKS (bot-token friendly):
 # Telegram blocks bots from using get_chat_history
@@ -368,215 +367,55 @@ async def del_caption(_, message):
 # known message IDs using get_messages(channel_id, [ids]).
 #
 # Channel message IDs are just sequential numbers, so we
-# scan backwards from the latest ID to ID 1 in chunks,
-# fetching each chunk with get_messages and editing any
-# file captions we find. No userbot needed.
+# scan backwards from a TOP id down to a FLOOR id in
+# chunks, fetching each chunk with get_messages and
+# editing any file captions we find. No userbot needed.
 #
-# - No cap: scans everything down to message ID 1 in one run
+# - No cap: scans the whole range in one run
 # - Saves checkpoint in MongoDB after every chunk (crash safety)
-# - If interrupted, run the command again to resume
+# - /stop_recaption cancels a running job (resumable)
+# - /recaption_range lets you pick a custom top/bottom ID
 # =========================================================
 
-RECAPTION_BATCH_LIMIT = None    # no cap — personal bot, scans everything in one run
 GET_MESSAGES_CHUNK = 200        # IDs fetched per get_messages call
 PROGRESS_UPDATE_EVERY = 5       # update progress message every N chunks
 
+# In-memory (per-process) state.
+# Stop flags and the range-flow Q&A are per-channel and
+# reset if the bot restarts — but the MongoDB checkpoint
+# still lets /recaption_all resume a stopped/interrupted job.
 
-@Client.on_message(
-    filters.command(
-        [
-            "recaption_all",
-            "update_old_captions"
-        ]
-    )
-    & filters.channel
-)
-async def recaption_all(bot, message):
-
-    channel_id = message.chat.id
-
-    # -----------------------------------------------------
-    # Check whether an old job is already in progress
-    # -----------------------------------------------------
-
-    old_job = await get_recaption_progress(
-        channel_id
-    )
-
-    # -----------------------------------------------------
-    # New caption / usage text
-    # -----------------------------------------------------
-
-    if len(message.command) < 2 and not old_job:
-
-        rep = await message.reply(
-            "<b>Usage:</b>\n\n"
-            "<code>/recaption_all YOUR NEW CAPTION</code>\n\n"
-            "<b>Example:</b>\n"
-            "<code>/recaption_all "
-            "🔥 Dreamxbotz Movies 🔥</code>\n\n"
-            "The old caption will be completely replaced.\n"
-            "This scans all old files in one run "
-            "(may take a while for large channels)."
-        )
-
-        asyncio.create_task(
-            delete_messages(message, rep)
-        )
-        return
-
-    if len(message.command) >= 2:
-
-        command_caption = message.text.split(
-            " ",
-            1
-        )[1].strip()
-
-    else:
-        command_caption = None
-
-    if command_caption is not None and not command_caption:
-
-        rep = await message.reply(
-            "❌ New caption cannot be empty."
-        )
-
-        asyncio.create_task(
-            delete_messages(message, rep)
-        )
-        return
-
-    if command_caption and len(command_caption) > 1024:
-
-        rep = await message.reply(
-            "❌ Caption is too long.\n\n"
-            "Telegram captions cannot be longer than "
-            "<code>1024</code> characters."
-        )
-
-        asyncio.create_task(
-            delete_messages(message, rep)
-        )
-        return
-
-    # -----------------------------------------------------
-    # If checkpoint exists, ALWAYS use its caption
-    # and resume from its saved position.
-    # -----------------------------------------------------
-
-    if old_job:
-
-        target_caption = old_job.get(
-            "caption",
-            command_caption
-        )
-
-        start_id = old_job.get(
-            "next_id"
-        )
-
-        processed = old_job.get(
-            "processed",
-            0
-        )
-
-        updated = old_job.get(
-            "updated",
-            0
-        )
-
-        skipped = old_job.get(
-            "skipped",
-            0
-        )
-
-        failed = old_job.get(
-            "failed",
-            0
-        )
-
-        resume_text = (
-            "♻️ <b>Resuming previous job...</b>\n\n"
-            f"Continuing down from message ID: "
-            f"<code>{start_id}</code>"
-        )
-
-    else:
-
-        target_caption = command_caption
-
-        # The command itself was just sent in this channel,
-        # so its own ID is at (or very near) the latest
-        # sequential message ID for this channel.
-        start_id = message.id - 1
-
-        processed = 0
-        updated = 0
-        skipped = 0
-        failed = 0
-
-        resume_text = (
-            "🚀 <b>Starting new recaption job...</b>\n\n"
-            f"Scanning downward from message ID: "
-            f"<code>{start_id}</code>"
-        )
-
-        await add_audit_log(
-            "recaption_all_started",
-            channel_id,
-            actor_id=getattr(
-                message.from_user,
-                "id",
-                None
-            ),
-            detail={
-                "caption": target_caption,
-                "start_id": start_id,
-                "mode": "id_range_scan",
-            },
-        )
-
-    if not start_id or start_id < 1:
-
-        await clear_recaption_progress(channel_id)
-
-        rep = await message.reply(
-            "✅ Nothing left to scan (reached message ID 1)."
-        )
-
-        asyncio.create_task(
-            delete_messages(message, rep)
-        )
-        return
-
-    # -----------------------------------------------------
-    # Progress message
-    # -----------------------------------------------------
-
-    progress_msg = await message.reply(
-        f"{resume_text}\n\n"
-        f"<b>Target caption:</b>\n"
-        f"<code>{target_caption}</code>\n\n"
-        f"Processed so far: <code>{processed}</code>\n"
-        f"Updated: <code>{updated}</code>\n"
-        f"Skipped: <code>{skipped}</code>\n"
-        f"Failed: <code>{failed}</code>"
-    )
+recaption_stop_flags = {}     # channel_id -> True (stop requested)
+recaption_range_state = {}    # channel_id -> {"stage": ..., "top_id": _id": ...}
+async def execute_recaption_job(
+    bot,
+    channel_id,
+    progress_msg,
+    target_caption,
+    start_id,
+    floor_id,
+    processed,
+    updated,
+    skipped,
+    failed,
+    actor_id=None,
+):
 
     current_id = start_id
     chunk_count = 0
+    stopped_by_user = False
 
-    # -----------------------------------------------------
-    # Scan backwards in chunks using get_messages
-    # (bot-token safe — no get_chat_history involved)
-    # Runs all the way down to message ID 1 in one go.
-    # -----------------------------------------------------
+    while current_id >= floor_id:
 
-    while current_id >= 1:
+        if recaption_stop_flags.get(channel_id):
+
+            recaption_stop_flags.pop(channel_id, None)
+            stopped_by_user = True
+            break
 
         take = min(
             GET_MESSAGES_CHUNK,
-            current_id
+            current_id - floor_id + 1
         )
 
         chunk_ids = list(
@@ -627,10 +466,6 @@ async def recaption_all(bot, message):
                 exc
             )
             messages = []
-
-        # Pyrogram returns messages in the same order as
-        # chunk_ids (ascending). Missing/deleted messages
-        # come back as empty Message objects.
 
         for msg in messages:
 
@@ -740,10 +575,6 @@ async def recaption_all(bot, message):
         current_id -= take
         chunk_count += 1
 
-        # ---------------------------------------------
-        # Save checkpoint after every chunk (crash safety)
-        # ---------------------------------------------
-
         try:
 
             await save_recaption_progress(
@@ -754,6 +585,7 @@ async def recaption_all(bot, message):
                 updated=updated,
                 skipped=skipped,
                 failed=failed,
+                floor_id=floor_id,
             )
 
         except Exception as checkpoint_exc:
@@ -763,11 +595,6 @@ async def recaption_all(bot, message):
                 current_id,
                 checkpoint_exc,
             )
-
-        # ---------------------------------------------
-        # Progress update (every few chunks, to avoid
-        # editing the progress message too often)
-        # ---------------------------------------------
 
         if chunk_count % PROGRESS_UPDATE_EVERY == 0:
 
@@ -786,17 +613,33 @@ async def recaption_all(bot, message):
                 pass
 
     # -----------------------------------------------------
-    # Job fully completed (current_id reached 0)
+    # Finished — stopped by user, or reached the floor
     # -----------------------------------------------------
 
+    if stopped_by_user:
+
+        try:
+
+            await progress_msg.edit(
+                "🛑 <b>Recaption stopped.</b>\n\n"
+                f"📨 Messages scanned: <code>{processed}</code>\n"
+                f"✏️ Captions updated: <code>{updated}</code>\n"
+                f"⏭ Skipped: <code>{skipped}</code>\n"
+                f"❌ Failed: <code>{failed}</code>\n\n"
+                f"Next message ID to scan: <code>{current_id}</code>\n\n"
+                "♻️ Progress is saved.\n"
+                "Run <code>/recaption_all</code> to resume."
+            )
+
+        except Exception:
+            pass
+
+        return
+
     await add_audit_log(
-        "recaption_all_completed",
+        "recaption_completed",
         channel_id,
-        actor_id=getattr(
-            message.from_user,
-            "id",
-            None
-        ),
+        actor_id=actor_id,
         detail={
             "processed": processed,
             "updated": updated,
@@ -818,12 +661,401 @@ async def recaption_all(bot, message):
             f"✏️ Captions updated: <code>{updated}</code>\n"
             f"⏭ Skipped: <code>{skipped}</code>\n"
             f"❌ Failed: <code>{failed}</code>\n\n"
-            "🎉 All available old files have been processed.\n\n"
+            "🎉 All files in range have been processed.\n\n"
             "♻️ Checkpoint removed from MongoDB."
         )
 
     except Exception:
         pass
+
+
+# =========================================================
+# STOP RECAPTION
+# =========================================================
+
+@Client.on_message(
+    filters.command("stop_recaption") & filters.channel
+)
+async def stop_recaption(bot, message):
+
+    channel_id = message.chat.id
+
+    recaption_stop_flags[channel_id] = True
+
+    rep = await message.reply(
+        "🛑 <b>Stop requested.</b>\n\n"
+        "The running recaption job will stop after "
+        "finishing its current batch.\n\n"
+        "Progress is saved — run <code>/recaption_all</code> "
+        "anytime to resume from where it stopped."
+    )
+
+    asyncio.create_task(
+        delete_messages(message, rep)
+    )
+
+
+# =========================================================
+# CANCEL (used to cancel the /recaption_range Q&A flow)
+# =========================================================
+
+@Client.on_message(
+    filters.command("cancel") & filters.channel
+)
+async def cancel_range_flow(bot, message):
+
+    channel_id = message.chat.id
+
+    if channel_id in recaption_range_state:
+
+        recaption_range_state.pop(channel_id, None)
+
+        rep = await message.reply("❌ Cancelled.")
+        asyncio.create_task(delete_messages(message, rep))
+
+
+# =========================================================
+# RECAPTION RANGE
+#
+# /recaption_range
+#
+# Interactive flow — bot asks for the TOP message ID,
+# then the BOTTOM message ID, then the new caption,
+# and scans only that range.
+# =========================================================
+
+@Client.on_message(
+    filters.command("recaption_range") & filters.channel
+)
+async def recaption_range_start(bot, message):
+
+    channel_id = message.chat.id
+
+    recaption_range_state[channel_id] = {
+        "stage": "top",
+        "requested_by": getattr(message.from_user, "id", None),
+    }
+
+    await message.reply(
+        "<b>Custom range recaption</b>\n\n"
+        "Send the <b>TOP</b> message ID "
+        "(the newer / higher one) to start from.\n\n"
+        "Send <code>/cancel</code> anytime to cancel."
+    )
+
+
+@Client.on_message(
+    filters.channel
+    & filters.text
+    & filters.create(
+        lambda _, __, m: m.chat.id in recaption_range_state
+    )
+)
+async def recaption_range_collect(bot, message):
+
+    channel_id = message.chat.id
+    state = recaption_range_state.get(channel_id)
+
+    if not state:
+        return
+
+    text = (message.text or "").strip()
+
+    # -----------------------------------------------------
+    # Stage 1: TOP id
+    # -----------------------------------------------------
+
+    if state["stage"] == "top":
+
+        if not text.isdigit():
+            await message.reply(
+                "❌ Please send a valid numeric message ID."
+            )
+            return
+
+        state["top_id"] = int(text)
+        state["stage"] = "bottom"
+
+        await message.reply(
+            "Got it. Now send the <b>BOTTOM</b> message ID "
+            "(the older / lower one) to stop at."
+        )
+        return
+
+    # -----------------------------------------------------
+    # Stage 2: BOTTOM id
+    # -----------------------------------------------------
+
+    if state["stage"] == "bottom":
+
+        if not text.isdigit():
+            await message.reply(
+                "❌ Please send a valid numeric message ID."
+            )
+            return
+
+        bottom_id = int(text)
+        top_id = state["top_id"]
+
+        if bottom_id > top_id:
+            top_id, bottom_id = bottom_id, top_id
+
+        state["bottom_id"] = bottom_id
+        state["top_id"] = top_id
+        state["stage"] = "caption"
+
+        await message.reply(
+            f"Range set: <code>{bottom_id}</code> to "
+            f"<code>{top_id}</code>.\n\n"
+            "Now send the <b>new caption</b> to apply "
+            "to every file in this range."
+        )
+        return
+
+    # -----------------------------------------------------
+    # Stage 3: caption — then start the job
+    # -----------------------------------------------------
+
+    if state["stage"] == "caption":
+
+        caption = text
+
+        if not caption:
+            await message.reply("❌ Caption cannot be empty.")
+            return
+
+        if len(caption) > 1024:
+            await message.reply(
+                "❌ Caption is too long "
+                "(max 1024 characters)."
+            )
+            return
+
+        top_id = state["top_id"]
+        bottom_id = state["bottom_id"]
+
+        recaption_range_state.pop(channel_id, None)
+
+        await add_audit_log(
+            "recaption_range_started",
+            channel_id,
+            actor_id=getattr(message.from_user, "id", None),
+            detail={
+                "caption": caption,
+                "top_id": top_id,
+                "bottom_id": bottom_id,
+            },
+        )
+
+        resume_text = (
+            "🚀 <b>Starting custom range recaption...</b>\n\n"
+            f"Range: <code>{bottom_id}</code> to "
+            f"<code>{top_id}</code>"
+        )
+
+        progress_msg = await message.reply(
+            f"{resume_text}\n\n"
+            f"<b>Target caption:</b>\n<code>{caption}</code>\n\n"
+            "Processed so far: <code>0</code>\n"
+            "Updated: <code>0</code>\n"
+            "Skipped: <code>0</code>\n"
+            "Failed: <code>0</code>"
+        )
+
+        await execute_recaption_job(
+            bot=bot,
+            channel_id=channel_id,
+            progress_msg=progress_msg,
+            target_caption=caption,
+            start_id=top_id,
+            floor_id=bottom_id,
+            processed=0,
+            updated=0,
+            skipped=0,
+            failed=0,
+            actor_id=getattr(message.from_user, "id", None),
+        )
+
+        return
+
+
+# =========================================================
+# RECAPTION ALL
+#
+# /recaption_all NEW CAPTION
+#
+# Scans everything from the latest message down to ID 1.
+# Use /recaption_range instead if you only want a
+# specific range. Use /stop_recaption to cancel either.
+# =========================================================
+
+@Client.on_message(
+    filters.command(
+        [
+            "recaption_all",
+            "update_old_captions"
+        ]
+    )
+    & filters.channel
+)
+async def recaption_all(bot, message):
+
+    channel_id = message.chat.id
+
+    old_job = await get_recaption_progress(
+        channel_id
+    )
+
+    if len(message.command) < 2 and not old_job:
+
+        rep = await message.reply(
+            "<b>Usage:</b>\n\n"
+            "<code>/recaption_all YOUR NEW CAPTION</code>\n\n"
+            "<b>Example:</b>\n"
+            "<code>/recaption_all "
+            "🔥 Dreamxbotz Movies 🔥</code>\n\n"
+            "Scans every old file all the way down to "
+            "message ID 1.\n\n"
+            "Want a specific range instead? Use "
+            "<code>/recaption_range</code>.\n"
+            "To stop a running job, use "
+            "<code>/stop_recaption</code>."
+        )
+
+        asyncio.create_task(
+            delete_messages(message, rep)
+        )
+        return
+
+    if len(message.command) >= 2:
+
+        command_caption = message.text.split(
+            " ",
+            1
+        )[1].strip()
+
+    else:
+        command_caption = None
+
+    if command_caption is not None and not command_caption:
+
+        rep = await message.reply(
+            "❌ New caption cannot be empty."
+        )
+
+        asyncio.create_task(
+            delete_messages(message, rep)
+        )
+        return
+
+    if command_caption and len(command_caption) > 1024:
+
+        rep = await message.reply(
+            "❌ Caption is too long.\n\n"
+            "Telegram captions cannot be longer than "
+            "<code>1024</code> characters."
+        )
+
+        asyncio.create_task(
+            delete_messages(message, rep)
+        )
+        return
+
+    if old_job:
+
+        target_caption = old_job.get(
+            "caption",
+            command_caption
+        )
+
+        start_id = old_job.get(
+            "next_id"
+        )
+
+        floor_id = old_job.get(
+            "floor_id",
+            1
+        )
+
+        processed = old_job.get("processed", 0)
+        updated = old_job.get("updated", 0)
+        skipped = old_job.get("skipped", 0)
+        failed = old_job.get("failed", 0)
+
+        resume_text = (
+            "♻️ <b>Resuming previous job...</b>\n\n"
+            f"Continuing down from message ID: "
+            f"<code>{start_id}</code>"
+        )
+
+    else:
+
+        target_caption = command_caption
+        start_id = message.id - 1
+        floor_id = 1
+
+        processed = 0
+        updated = 0
+        skipped = 0
+        failed = 0
+
+        resume_text = (
+            "🚀 <b>Starting new recaption job...</b>\n\n"
+            f"Scanning downward from message ID: "
+            f"<code>{start_id}</code>"
+        )
+
+        await add_audit_log(
+            "recaption_all_started",
+            channel_id,
+            actor_id=getattr(
+                message.from_user,
+                "id",
+                None
+            ),
+            detail={
+                "caption": target_caption,
+                "start_id": start_id,
+                "mode": "id_range_scan",
+            },
+        )
+
+    if not start_id or start_id < floor_id:
+
+        await clear_recaption_progress(channel_id)
+
+        rep = await message.reply(
+            "✅ Nothing left to scan."
+        )
+
+        asyncio.create_task(
+            delete_messages(message, rep)
+        )
+        return
+
+    progress_msg = await message.reply(
+        f"{resume_text}\n\n"
+        f"<b>Target caption:</b>\n"
+        f"<code>{target_caption}</code>\n\n"
+        f"Processed so far: <code>{processed}</code>\n"
+        f"Updated: <code>{updated}</code>\n"
+        f"Skipped: <code>{skipped}</code>\n"
+        f"Failed: <code>{failed}</code>"
+    )
+
+    await execute_recaption_job(
+        bot=bot,
+        channel_id=channel_id,
+        progress_msg=progress_msg,
+        target_caption=target_caption,
+        start_id=start_id,
+        floor_id=floor_id,
+        processed=processed,
+        updated=updated,
+        skipped=skipped,
+        failed=failed,
+        actor_id=getattr(message.from_user, "id", None),
+    )
 
 
 # =========================================================
